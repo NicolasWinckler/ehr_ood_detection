@@ -24,6 +24,7 @@ from uncertainty_estimation.models.info import (
 
 # CONSTANTS
 AVAILABLE_TYPES = {"real", "positive_real", "count", "categorical", "ordinal"}
+GROUPABLE_TYPES = {"real", "positive_real", "count"}
 
 # TYPES
 # A list of tuples specifying the types of input features
@@ -281,11 +282,13 @@ class NormalDecoder(VarDecoder):
         hidden_size: int,
         feat_type: Tuple[str, Optional[int], Optional[int]],
         encoder_batch_norm: torch.nn.BatchNorm1d,
+        num_vars: int,
     ):
         super().__init__(hidden_size, feat_type)
 
-        self.mean = nn.Linear(hidden_size, 1)
-        self.var = nn.Linear(hidden_size, 1)
+        self.num_vars = num_vars
+        self.mean = nn.Linear(hidden_size, num_vars)
+        self.var = nn.Linear(hidden_size, num_vars)
         self.encoder_sb = encoder_batch_norm
 
     def forward(self, hidden: torch.Tensor, dim: int, reconstruction_mode: str):
@@ -354,11 +357,13 @@ class PoissonDecoder(VarDecoder):
         self,
         hidden_size: int,
         feat_type: Tuple[str, Optional[int], Optional[int]],
+        num_vars: int,
         **unused,
     ):
         super().__init__(hidden_size, feat_type)
 
-        self.lambda_ = nn.Linear(hidden_size, 1)
+        self.num_vars = num_vars
+        self.lambda_ = nn.Linear(hidden_size, num_vars)
 
     def forward(self, hidden: torch.Tensor, dim: int, reconstruction_mode: str):
         lambda_ = F.softplus(self.lambda_(hidden)).float()
@@ -510,7 +515,7 @@ class HIDecoder(nn.Module):
     ):
         super().__init__()
 
-        self.decoding_models = {
+        self.decoding_classes = {
             "real": NormalDecoder,
             "positive_real": LogNormalDecoder,
             "count": PoissonDecoder,
@@ -519,6 +524,9 @@ class HIDecoder(nn.Module):
         }
 
         self.feat_types = feat_types
+        self.reduced_feat_types = list(
+            sorted(Counter(list(zip(*feat_types))[0]).items(), key=lambda c: c[0])
+        )
         self.n_mix_components = n_mix_components
         self.encoder_bn = encoder_batch_norm
 
@@ -532,14 +540,28 @@ class HIDecoder(nn.Module):
         self.hidden = nn.Sequential(*self.layers)
 
         # Initialize all the output networks
-        self.decoding_models = [
-            self.decoding_models[feat_type[0]](
-                architecture[-1] + n_mix_components,
-                feat_type,
-                encoder_batch_norm=encoder_batch_norm,
-            )
-            for feat_type in feat_types
-        ]
+        self.decoding_models = []
+
+        for feat_type, num in self.reduced_feat_types:
+            if feat_type in GROUPABLE_TYPES:
+                self.decoding_models.append(
+                    self.decoding_classes[feat_type](
+                        architecture[-1] + n_mix_components,
+                        feat_type=feat_type,
+                        encoder_batch_norm=encoder_batch_norm,
+                        num_vars=num,
+                    )
+                )
+
+            else:
+                for _ in range(num):
+                    self.decoding_models.append(
+                        self.decoding_classes[feat_type](
+                            architecture[-1] + n_mix_components,
+                            feat_type=feat_type,
+                            encoder_batch_norm=encoder_batch_norm,
+                        )
+                    )
 
     def forward(
         self,
@@ -556,6 +578,7 @@ class HIDecoder(nn.Module):
         for dim, (feat_type, decoding_func) in enumerate(
             zip(self.feat_types, self.decoding_models)
         ):
+            # TODO: Decode whole chunks
             reconstruction[:, dim] = decoding_func(h, dim, reconstruction_mode)
 
         return reconstruction
@@ -571,10 +594,28 @@ class HIDecoder(nn.Module):
         h = torch.cat([h, mix_components], dim=1)
         reconstruction_loss = torch.zeros(input_tensor.shape)
 
-        for feat_num, decoding_model in enumerate(self.decoding_models):
-            reconstruction_loss[:, feat_num] = decoding_model.reconstruction_error(
-                input_tensor[:, feat_num], h, dim=feat_num
-            )
+        # Adapt decoding
+        # Decode whole chunks
+        dim = 0
+        for (feat_type, num_vars), decoding_model in zip(
+            self.reduced_feat_types, self.decoding_models
+        ):
+            if feat_type in GROUPABLE_TYPES:
+                reconstruction_loss[
+                    :, dim : dim + num_vars
+                ] = decoding_model.reconstruction_error(
+                    input_tensor[:, dim : dim + num_vars],
+                    h,
+                    dim=torch.arange(dim, dim + num_vars),
+                )
+                dim += num_vars
+
+            else:
+                for i in range(num_vars):
+                    reconstruction_loss[:, dim] = decoding_model.reconstruction_error(
+                        input_tensor[:, dim], h, dim=dim
+                    )
+                    dim += 1
 
         reconstruction_loss[
             ~observed_mask
@@ -602,13 +643,20 @@ class HIVAEModule(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_mix_components = n_mix_components
+        (
+            self.sorting_mask,
+            self.inverted_sorting_mask,
+            self.feat_types,
+        ) = self.create_sorting_masks(feat_types)
 
-        self.encoder = HIEncoder(hidden_sizes, latent_dim, n_mix_components, feat_types)
+        self.encoder = HIEncoder(
+            hidden_sizes, latent_dim, n_mix_components, self.feat_types
+        )
         self.decoder = HIDecoder(
             hidden_sizes,
             latent_dim,
             n_mix_components,
-            feat_types,
+            self.feat_types,
             encoder_batch_norm=self.encoder.real_batch_norm,
         )
 
@@ -625,6 +673,7 @@ class HIVAEModule(nn.Module):
         )
 
         input_tensor = input_tensor.float()
+        input_tensor = input_tensor[:, self.sorting_mask]
 
         # Encoding
         mean, std, mix_components_dists, observed_mask = self.encoder(input_tensor)
@@ -669,6 +718,7 @@ class HIVAEModule(nn.Module):
     ) -> torch.Tensor:
 
         input_tensor = input_tensor.float()
+        input_tensor = input_tensor[:, self.sorting_mask]
 
         # Encoding
         mean, std, observed_mask = self.encoder(input_tensor)
@@ -677,8 +727,28 @@ class HIVAEModule(nn.Module):
 
         # Reconstruction
         reconstruction = self.decoder(latent_tensor, reconstruction_mode)
+        reconstruction = reconstruction[:, self.inverted_sorting_mask]
 
         return reconstruction
+
+    @staticmethod
+    def create_sorting_masks(
+        feat_types: FeatTypes,
+    ) -> Tuple[torch.Tensor, torch.Tensor, FeatTypes]:
+        types_and_indices = zip(range(0, len(feat_types)), feat_types)
+        sorted_types = list(sorted(types_and_indices, key=lambda t: t[1][0]))
+        sorted_feat_types, sorted_indices = (
+            list(zip(*sorted_types))[1],
+            list(zip(*sorted_types))[0],
+        )
+        inverse_sorting_mask = torch.Tensor(sorted_indices).long()
+
+        # Create sorting mask
+        sorting_mask = torch.zeros(len(feat_types))
+        for idx, val in enumerate(inverse_sorting_mask):
+            sorting_mask[val.long()] = idx
+
+        return sorting_mask.long(), inverse_sorting_mask, sorted_feat_types
 
 
 class HIVAE(VAE):
